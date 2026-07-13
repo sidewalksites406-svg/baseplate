@@ -1,304 +1,96 @@
-/**
- * Baseplate scraper
- * ------------------
- * Pulls game lists from Roblox's discovery ("explore") API, then fetches
- * details for each universe in batches from the public games.roblox.com API.
- *
- * IMPORTANT: Roblox does not publish or guarantee these endpoints. They are
- * the same calls the roblox.com/discover page itself makes, reverse-engineered
- * by the dev community, and they change without notice. If scraping stops
- * returning results, check https://devforum.roblox.com (search "explore-api"
- * or "omni-recommendation") for the current pattern and update SORT_IDS /
- * EXPLORE_URL below. The seed list at the bottom guarantees the app always
- * has *some* data even if live scraping breaks entirely.
- */
+# Baseplate — Roblox Game Finder (backend edition)
 
-/**
- * Baseplate scraper
- * ------------------
- * Pulls game lists from Roblox using several strategies, layered so that if
- * one breaks (which happens often — Roblox changes these without notice),
- * the others still bring in data. Strategy order:
- *
- *   1. Explore API sorts (apis.roblox.com/explore-api) — the same calls
- *      roblox.com/discover makes. Paginated per sort, many sorts, many pages.
- *   2. Genre-based discovery via the legacy games list endpoint, tried as a
- *      secondary source in case explore-api is unavailable.
- *   3. Keyword search sweep — searches a wide list of common genre/keyword
- *      terms and pulls whatever universe IDs come back, which surfaces
- *      titles outside the "trending" sorts (older but still 1000+ player
- *      games that would otherwise never appear).
- *   4. Seed dataset — always layered in underneath, so the floor never drops
- *      below the curated 100+ list regardless of what live scraping finds.
- *
- * None of these are officially documented or guaranteed by Roblox. If a
- * strategy starts returning nothing, check devforum.roblox.com (search
- * "explore-api" or "omni-search") for the current pattern and update the
- * URL builders below.
- */
+This is the real version of the app: a small server that scrapes Roblox's
+game data on its own, stores it in a database, and serves it to a website
+your friends (or the public) can use. This is the only version that can
+realistically show 700+ real games, because Roblox blocks that kind of
+scraping from a plain browser page — it has to come from a server.
 
-const fetch = require('node-fetch');
-const { upsertGame, countGames } = require('./db');
+## What's inside
 
-const HEADERS = {
-  'Accept': 'application/json',
-  'User-Agent': 'Mozilla/5.0 (compatible; BaseplateBot/1.0)'
-};
-if (process.env.ROBLOSECURITY) {
-  HEADERS['Cookie'] = `.ROBLOSECURITY=${process.env.ROBLOSECURITY}`;
-}
+- `server.js` — the web server. Serves the frontend and a JSON API.
+- `scraper.js` — pulls game data from Roblox and saves it to the database.
+  Runs once on startup, then automatically every 3 days via cron.
+- `db.js` — SQLite database (a single file, no separate database service needed).
+- `seed-games.json` — 100+ real, hand-verified popular games. Always loaded
+  as a floor, so the app is never empty even if live scraping breaks.
+- `public/index.html` — the website your friends will actually use.
 
-async function safeJson(url, opts = {}) {
-  try {
-    const res = await fetch(url, { headers: HEADERS, ...opts });
-    if (!res.ok) {
-      console.warn(`[scraper] ${url} -> ${res.status}`);
-      return null;
-    }
-    return await res.json();
-  } catch (e) {
-    console.warn(`[scraper] fetch failed for ${url}:`, e.message);
-    return null;
-  }
-}
+## Important honesty note
 
-// ---- Strategy 1: explore-api sorts, many sorts, multiple pages each ----
-const EXPLORE_SORTS_URL = 'https://apis.roblox.com/explore-api/v1/get-sorts?sessionId=baseplate-scraper';
-const EXPLORE_CONTENT_URL = (sortId, cursor) =>
-  `https://apis.roblox.com/explore-api/v1/get-sort-content?sessionId=baseplate-scraper&sortId=${encodeURIComponent(sortId)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+Roblox does not officially support this kind of scraping, and their
+internal API endpoints change without notice (confirmed by their own
+developer forum). `scraper.js` is written defensively: if the live scrape
+fails for any reason, it silently falls back to the 100+ game seed list so
+the app still works. Over time you (or I, in a future session) may need to
+update the endpoint URLs in `scraper.js` if Roblox changes them again —
+search "explore-api" or "games.roblox.com/v1/games" on
+devforum.roblox.com for the current pattern.
 
-async function strategyExploreSorts(maxSorts = 40, maxPagesPerSort = 15) {
-  const ids = new Set();
-  const sortsData = await safeJson(EXPLORE_SORTS_URL);
-  const sorts = sortsData?.sorts?.slice(0, maxSorts) || [];
+## Running it locally (to test)
 
-  for (const sort of sorts) {
-    const sortId = sort.sortId || sort.id;
-    if (!sortId) continue;
-    let cursor = null;
-    for (let page = 0; page < maxPagesPerSort; page++) {
-      const content = await safeJson(EXPLORE_CONTENT_URL(sortId, cursor));
-      const tiles = content?.games || content?.tiles || [];
-      for (const tile of tiles) {
-        const uid = tile.universeId || tile.contentId || tile.id;
-        if (uid) ids.add(uid);
-      }
-      cursor = content?.nextPageCursor || content?.cursor || null;
-      if (!cursor || tiles.length === 0) break;
-    }
-  }
-  return ids;
-}
+```bash
+npm install
+npm start
+```
 
-// ---- Strategy 2: legacy sorted list endpoint (older, sometimes still alive) ----
-const LEGACY_LIST_URL = (genre, startRows) =>
-  `https://games.roblox.com/v1/games/list?model.sortToken=&model.genre=${encodeURIComponent(genre || '')}&model.startRows=${startRows}&model.maxRows=50`;
+Then open `http://localhost:3000` in your browser.
 
-async function strategyLegacyList() {
-  const ids = new Set();
-  const genres = ['', 'Adventure', 'Building', 'Comedy', 'Fighting', 'FPS', 'Horror',
-    'Medieval', 'Military', 'Naval', 'RPG', 'Sci-Fi', 'Sports', 'Survival', 'Town and City',
-    'Tycoon', 'Simulation', 'Puzzle', 'Racing', 'Roleplay & Avatar Sim', 'Strategy', 'Western'];
-  const pagesPerGenre = 3; // startRows 0, 50, 100
-  for (const g of genres) {
-    for (let page = 0; page < pagesPerGenre; page++) {
-      const data = await safeJson(LEGACY_LIST_URL(g, page * 50));
-      const games = data?.games || [];
-      for (const game of games) {
-        const uid = game.universeId || game.placeId;
-        if (uid) ids.add(uid);
-      }
-      if (games.length === 0) break;
-    }
-  }
-  return ids;
-}
+## Deploying so friends can use it
 
-// ---- Strategy 3: keyword search sweep, catches non-trending 1000+ games ----
-const SEARCH_URL = (keyword) =>
-  `https://apis.roblox.com/search-api/omni-search?searchQuery=${encodeURIComponent(keyword)}&sessionId=baseplate-scraper&pageType=games`;
+The easiest free options are **Render** or **Railway** — both can run a
+Node.js app with a persistent disk for the SQLite file for free at small scale.
 
-const KEYWORDS = [
-  'simulator', 'tycoon', 'obby', 'roleplay', 'horror', 'anime', 'racing', 'fighting',
-  'survival', 'rpg', 'adventure', 'sports', 'fps', 'tower defense', 'battle royale',
-  'pet', 'city', 'life', 'story', 'puzzle', 'strategy', 'shooter', 'zombie', 'pirate',
-  'ninja', 'superhero', 'magic', 'school', 'restaurant', 'farm', 'building', 'war',
-  'escape', 'mystery', 'clicker', 'idle', 'fantasy', 'sci-fi', 'space', 'racing game',
-  'parkour', 'boxing', 'basketball', 'football', 'soccer', 'skate', 'car', 'plane',
-  'mining', 'fishing', 'cooking', 'hospital', 'prison', 'police', 'military', 'medieval',
-  'demon', 'dragon', 'sword', 'gun', 'battlegrounds', 'legends', 'clicker rpg', 'grinding',
-  'rebirth', 'pvp', 'coop', 'party game', 'minigames', 'hangout', 'roleplay life',
-  'brainrot', 'aura', 'demon slayer', 'one piece', 'naruto', 'jujutsu', 'dragon ball',
-  'island', 'ocean', 'boat', 'ship', 'castle', 'kingdom', 'empire', 'factory', 'mine',
-  'gym', 'muscle', 'strength', 'combat', 'arena', 'duel', 'gang', 'mafia', 'heist',
-  'restaurant tycoon', 'theme park', 'zoo', 'hospital tycoon', 'airport', 'train',
-  'trucking', 'delivery', 'detective', 'spy', 'assassin', 'monster', 'alien', 'robot',
-  'dinosaur', 'egg', 'garden', 'farming sim', 'cooking sim', 'baking', 'bakery',
-  'wizard', 'witch', 'vampire', 'werewolf', 'god', 'titan', 'giant', 'meme', 'viral',
-  'new game', 'unique game', 'never before', 'experimental', 'original', 'weird game',
-  'chaos', 'physics', 'sandbox', 'creative', 'open world', 'multiplayer', 'party',
-  'jump', 'run', 'climb', 'swim', 'fly', 'race', 'collect', 'craft', 'build', 'trade',
-  'economy', 'business', 'store', 'shop', 'market', 'auction', 'casino', 'lottery',
-  'trivia', 'quiz', 'board game', 'card game', 'chess', 'checkers', 'game show',
-  'talent show', 'singing', 'dance', 'music', 'concert', 'festival', 'wedding',
-  'baby', 'family', 'daycare', 'nursery', 'vet', 'animal', 'dog', 'cat', 'horse',
-  'dragon tamer', 'summoner', 'necromancer', 'mage', 'archer', 'knight', 'samurai',
-  'cyberpunk', 'steampunk', 'apocalypse', 'wasteland', 'bunker', 'nuclear', 'radiation'
-];
+### Render (recommended, free tier available)
+1. Push this folder to a new GitHub repo.
+2. Go to render.com → New → Web Service → connect the repo.
+3. Build command: `npm install`
+4. Start command: `npm start`
+5. Add a free persistent disk mounted at `/opt/render/project/src` (or wherever
+   the app runs) so `baseplate.db` isn't wiped on redeploys.
+6. Deploy. Render gives you a public URL like `baseplate.onrender.com` —
+   that's the link you send your 5 friends (or anyone, if you go public later).
 
-async function strategyKeywordSweep() {
-  const ids = new Set();
-  for (const kw of KEYWORDS) {
-    const data = await safeJson(SEARCH_URL(kw));
-    const items = data?.searchResults?.flatMap(g => g.contents || []) || data?.games || [];
-    for (const item of items) {
-      const uid = item.universeId || item.contentId || item.id;
-      if (uid) ids.add(uid);
-    }
-  }
-  return ids;
-}
+### Railway (also easy)
+1. Push to GitHub.
+2. railway.app → New Project → Deploy from GitHub repo.
+3. Railway auto-detects Node and runs `npm start`.
+4. Add a volume for persistent storage of `baseplate.db`.
+5. Generate a public domain in the Railway dashboard.
 
-// ---- Detail fetch (confirmed stable, public, no auth needed, up to ~50 ids/call) ----
-const GAMES_DETAILS_URL = (ids) => `https://games.roblox.com/v1/games?universeIds=${ids.join(',')}`;
-// Roblox's icon/thumbnail API is a separate endpoint from game details.
-const THUMBNAILS_URL = (ids) =>
-  `https://thumbnails.roblox.com/v1/games/icons?universeIds=${ids.join(',')}&size=512x512&format=Png&isCircular=false`;
+## If Roblox requires login for scraping
 
-async function fetchGameDetails(universeIds) {
-  const results = [];
-  const list = [...universeIds];
-  for (let i = 0; i < list.length; i += 50) {
-    const batch = list.slice(i, i + 50);
-    const data = await safeJson(GAMES_DETAILS_URL(batch));
-    if (data && Array.isArray(data.data)) results.push(...data.data);
-  }
-  return results;
-}
+If `scraper.js` stops finding live games (check server logs for
+`[scraper] no live universe IDs found`), Roblox may have tightened auth
+requirements. You can supply a `.ROBLOSECURITY` cookie from a real Roblox
+account as an environment variable:
 
-async function fetchThumbnails(universeIds) {
-  // Returns a Map of universeId -> imageUrl. Batched like details; if a
-  // batch call fails outright, falls back to fetching that batch's games
-  // one at a time so a single bad batch doesn't cost every game in it its
-  // thumbnail. Games that still fail just fall back to the placeholder
-  // gradient on the frontend rather than breaking the scrape.
-  const map = new Map();
-  const list = [...universeIds];
+```
+ROBLOSECURITY=your_cookie_value_here
+```
 
-  for (let i = 0; i < list.length; i += 50) {
-    const batch = list.slice(i, i + 50);
-    const data = await safeJson(THUMBNAILS_URL(batch));
-    const entries = data?.data || [];
-    const gotIds = new Set();
-    for (const entry of entries) {
-      if (entry.targetId && entry.imageUrl && entry.state !== 'Error') {
-        map.set(entry.targetId, entry.imageUrl);
-        gotIds.add(entry.targetId);
-      }
-    }
+Set this in Render/Railway's environment variables panel — never commit it
+to GitHub. Using a throwaway account (not your main) is safer for this.
 
-    // Anything missing from this batch (failed call, partial response, or
-    // an errored thumbnail state) gets one individual retry.
-    const missing = batch.filter(id => !gotIds.has(id));
-    for (const id of missing) {
-      const single = await safeJson(THUMBNAILS_URL([id]));
-      const entry = single?.data?.[0];
-      if (entry?.imageUrl && entry.state !== 'Error') {
-        map.set(id, entry.imageUrl);
-      }
-    }
-  }
-  return map;
-}
+## Manually triggering a re-scrape
 
-// ---- Seed floor, always layered in ----
-const SEED_GAMES = require('./seed-games.json');
+```
+POST https://your-deployed-url/api/scrape-now
+```
 
-async function seedFallback() {
-  for (const g of SEED_GAMES) {
-    upsertGame({
-      universe_id: g.id,
-      root_place_id: g.id,
-      name: g.name,
-      description: g.desc,
-      genre: g.genre,
-      playing: g.players,
-      visits: g.players * 1000,
-      is_mobile: g.plat.includes('mobile') ? 1 : 0,
-      is_console: g.plat.includes('console') ? 1 : 0,
-      is_pc: g.plat.includes('pc') ? 1 : 0,
-      thumbnail_url: null
-    });
-  }
-}
+Useful right after deploying, instead of waiting for the 3-day cron.
 
-async function run() {
-  console.log('[scraper] starting run...');
-  const allIds = new Set();
+## Thumbnails
 
-  const attempts = [
-    ['explore-sorts', strategyExploreSorts],
-    ['legacy-list', strategyLegacyList],
-    ['keyword-sweep', strategyKeywordSweep]
-  ];
+Live-scraped games get a real thumbnail pulled from Roblox's thumbnails API
+(a separate call from game details). Seed dataset games don't have real
+Roblox universe IDs, so they show a genre-colored gradient placeholder
+instead — you'll see real images fill in as the scraper finds live games.
 
-  for (const [label, fn] of attempts) {
-    try {
-      const ids = await fn();
-      console.log(`[scraper] strategy "${label}" found ${ids.size} candidate IDs`);
-      ids.forEach(id => allIds.add(id));
-    } catch (e) {
-      console.warn(`[scraper] strategy "${label}" failed:`, e.message);
-    }
-  }
+## What you get day one
 
-  if (allIds.size === 0) {
-    console.warn('[scraper] no live universe IDs found from any strategy (Roblox endpoints likely changed or require auth). Using seed dataset only.');
-    await seedFallback();
-    console.log(`[scraper] done. total games in db: ${countGames()}`);
-    return;
-  }
-
-  console.log(`[scraper] ${allIds.size} unique candidate games found across all strategies, fetching details...`);
-  const details = await fetchGameDetails(allIds);
-
-  // Only bother fetching thumbnails for games that will actually be saved
-  // (meets the activity floor), to avoid wasting calls on filtered-out junk.
-  const qualifyingIds = details.filter(g => (g.playing || 0) >= 500).map(g => g.id);
-  console.log(`[scraper] fetching thumbnails for ${qualifyingIds.length} qualifying games...`);
-  const thumbMap = await fetchThumbnails(qualifyingIds);
-
-  let saved = 0;
-  for (const g of details) {
-    // Only keep games meeting a reasonable activity floor, to avoid junk/dead universes.
-    // (500 players — anything below this isn't worth surfacing per your call.)
-    if ((g.playing || 0) < 500) continue;
-    upsertGame({
-      universe_id: g.id,
-      root_place_id: g.rootPlaceId,
-      name: g.name,
-      description: (g.description || '').slice(0, 500),
-      genre: g.genre || 'Other',
-      playing: g.playing || 0,
-      visits: g.visits || 0,
-      is_mobile: 1,
-      is_console: g.isXboxOne ? 1 : 0,
-      is_pc: 1,
-      thumbnail_url: thumbMap.get(g.id) || null
-    });
-    saved++;
-  }
-  console.log(`[scraper] saved ${saved} live games (of ${details.length} fetched, ${allIds.size} candidates).`);
-
-  await seedFallback();
-  console.log(`[scraper] done. total games in db: ${countGames()}`);
-}
-
-if (require.main === module) {
-  run().then(() => process.exit(0)).catch(e => {
-    console.error('[scraper] fatal error:', e);
-    process.exit(1);
-  });
-}
-
-module.exports = { run };
+Even with zero successful live scrapes, you get 100+ real, currently
+popular Roblox games with genres, descriptions, and platform tags —
+already a big step up from the 25-game static list. As live scraping
+succeeds (or as you manually add more to `seed-games.json`), the number
+grows toward your 700+ target with real data instead of invented entries.
